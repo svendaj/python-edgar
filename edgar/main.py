@@ -14,7 +14,9 @@ import time
 EDGAR_PREFIX = "https://www.sec.gov/Archives/"
 SEP = "|"
 IS_PY3 = sys.version_info[0] >= 3
-REQUEST_BUDGET_MS = 200
+MAX_NO_OF_CALLS_PER_PERIOD = 10
+PERIOD = datetime.timedelta(seconds=1)
+
 
 def _get_current_quarter():
     return "QTR%s" % ((datetime.date.today().month - 1) // 3 + 1)
@@ -110,9 +112,6 @@ def _download(file, dest, skip_file, user_agent):
         raise logging.error("python-edgar only supports zipped index files")
 
 
-def _get_millis():
-    return round(time.time() * 1000)
-
 def download_index(dest, since_year, user_agent, skip_all_present_except_last=False):
     """
     Convenient method to download all files at once
@@ -122,21 +121,29 @@ def download_index(dest, since_year, user_agent, skip_all_present_except_last=Fa
 
     tasks = _quarterly_idx_list(since_year)
     logging.info("%d index files to retrieve", len(tasks))
-    last_download_at = _get_millis()
-    for i, file in enumerate(tasks):
-        skip_file = skip_all_present_except_last
-        if i == 0:
-            # First one should always be re-downloaded
-            skip_file = False
-        # naive: 200ms or 5QPS serialized
-        start = _get_millis()
-        _download(file, dest, skip_file, user_agent)
-        elapsed = _get_millis() - start
-        if elapsed < REQUEST_BUDGET_MS:
-            sleep_for = REQUEST_BUDGET_MS-elapsed
-            logging.info("sleeping for %dms because we are going too fast (previous request took %dms", sleep_for, elapsed)
-            time.sleep(sleep_for/1000)
-        last_download_at = _get_millis()
-
+    
+    # make list of processes to be run in parallel, first should be always downloaded
+    processes = [multiprocessing.Process(target = _download, args=(file, dest, False, user_agent)) if i == 0 else \
+                multiprocessing.Process(target = _download, args=(file, dest, skip_all_present_except_last, user_agent)) \
+                for i, file in enumerate(tasks) ]
+    # group processes into sublists of maximum number of calls per period
+    processes = [ processes[i:i+MAX_NO_OF_CALLS_PER_PERIOD] for i in range(0, len(processes), MAX_NO_OF_CALLS_PER_PERIOD)]
+    
+    
+    for process_group in processes:
+        Start = datetime.datetime.now()
+        for p in process_group:
+            p.start()
+        # if max alowed number of calls launched sooner than given period of time, 
+        # then wait until end of period 
+        Stop = datetime.datetime.now()
+        if Stop < (Start + PERIOD):
+            Wait_time = ((Start + PERIOD)-Stop).total_seconds()
+            time.sleep(Wait_time)
+            logging.info(f"sleeping for {Wait_time*1000} ms because we are going too fast, "
+                + f"previous {MAX_NO_OF_CALLS_PER_PERIOD} downloads were spawned in {(Stop - Start).total_seconds()*1000} ms")
+        
+        for p in process_group:
+            p.join()
 
     logging.info("complete")
